@@ -1,0 +1,123 @@
+name: Create Tag and Release
+on:
+  push:
+    branches: [main]
+    paths: [Dockerfile, .tool-versions, scripts/**, .github/actions/**, .github/workflows/**]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(awk '$1 == "actions-runner" {print $2}' .tool-versions)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq '.[].tag_name' | grep -Fxq "v$version"; then
+            echo "Release v$version already exists; the image build will still run."
+            exit 0
+          fi
+          gh release view "v$version" --repo actions/runner --json body --jq '.body' > "$RUNNER_TEMP/upstream-notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/upstream-notes.md"; then
+            echo "::error::Upstream release notes for v$version are empty."
+            exit 1
+          fi
+          cat > "$RUNNER_TEMP/release.md" <<NOTES
+          ## GitHub Actions Runner $version for OKE
+
+          Custom image based on the official GitHub Actions runner, with container build,
+          Kubernetes deployment, and Oracle Cloud tools for self-hosted runners on
+          **Oracle Kubernetes Engine (OKE)**.
+
+          ### Container image
+
+          | Registry | Image |
+          | --- | --- |
+          | GHCR | \`ghcr.io/$GITHUB_REPOSITORY:$version\` |
+          | Platforms | \`linux/amd64\`, \`linux/arm64\` |
+          | Tags | \`$version\`, \`latest\`, \`sha-$GITHUB_SHA\` |
+          | Base image | \`ghcr.io/actions/actions-runner:$version\` |
+          | Default user | \`runner\` |
+
+          ### Included tools
+
+          | Category | Tools |
+          | --- | --- |
+          | Container builds | Docker CLI, Docker Buildx, Docker Compose, Buildah |
+          | Kubernetes | kubectl, Helm, standalone Kustomize |
+          | Oracle Cloud | OCI CLI, installed with uv in an isolated Python environment |
+          | Development | uv, Python 3, Git, jq, yq, make, GCC, G++ |
+
+          ### Pull the image
+
+          \`\`\`bash
+          docker pull ghcr.io/$GITHUB_REPOSITORY:$version
+          docker pull ghcr.io/$GITHUB_REPOSITORY:latest
+          \`\`\`
+
+          Both tags select the platform matching the host. Use an image digest when you
+          need an immutable reference; version tags can be rebuilt when tooling changes.
+
+          ### Use with Actions Runner Controller
+
+          Set the image in your existing ARC runner scale set Helm values:
+
+          \`\`\`yaml
+          template:
+            spec:
+              containers:
+                - name: runner
+                  image: ghcr.io/$GITHUB_REPOSITORY:$version
+                  command: ["/home/runner/run.sh"]
+          \`\`\`
+
+          Keep your existing ARC authentication, volumes, and Docker-in-Docker setup.
+          This snippet overrides the image; it is not a complete ARC installation.
+
+          ### Container build requirements
+
+          - **Docker / Buildx:** requires a reachable Docker daemon, such as an ARC
+            Docker-in-Docker sidecar. The image includes the client tools.
+          - **Buildah:** configured with VFS storage, chroot isolation, and subordinate
+            UID/GID ranges for the runner user. The host must allow user namespaces
+            and the pod must permit the required namespace operations.
+          - Rootless execution depends on the node and pod security policy. Validation
+            builds an image containing a \`RUN\` instruction as both \`runner\` and root
+            in privileged containers on native AMD64 and ARM64 runners.
+
+          ### Publication and validation
+
+          Image publication follows creation of this release. The build workflow tests
+          each architecture natively before assembling the multi-platform tags.
+          Check [Build and Publish Docker Image](https://github.com/$GITHUB_REPOSITORY/actions/workflows/build-and-publish.yml)
+          for completion before pulling a new release.
+
+          GHCR is the default registry. OCIR publication is optional and requires
+          \`OCIR_ENABLED=true\` plus the credentials documented in the README.
+
+          ### Documentation and upstream changes
+
+          - [Setup, examples, registry configuration, and troubleshooting](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/README.md)
+          - [Dockerfile for this release](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/Dockerfile)
+          - [Upstream runner release notes](https://github.com/actions/runner/releases/tag/v$version)
+          - [Published container package](https://github.com/orgs/${GITHUB_REPOSITORY%%/*}/packages/container/package/${GITHUB_REPOSITORY#*/})
+          ## Upstream runner release notes
+
+          The following notes are copied from [actions/runner v$version](https://github.com/actions/runner/releases/tag/v$version).
+          Download links in this section refer to the upstream runner binaries.
+          For the customized OKE image, use the container commands above.
+
+          NOTES
+          cat "$RUNNER_TEMP/upstream-notes.md" >> "$RUNNER_TEMP/release.md"
+          gh release create "v$version" --target "$GITHUB_SHA" --title "🎉 Release v$version" --notes-file "$RUNNER_TEMP/release.md"
